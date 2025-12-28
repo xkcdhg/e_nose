@@ -1,0 +1,301 @@
+import os
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Conv1D, MaxPooling1D, Flatten
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --- 1. Data Loading and Preprocessing ---
+def load_and_preprocess_data(data_dir, sequence_length=180, n_features=9):
+    """
+    Loads data from all CSV files, processes them into sequences,
+    and creates a single DataFrame.
+
+    Args:
+        data_dir (str): Directory containing the CSV files.
+        sequence_length (int): Length of the time series sequences to be used as input.
+                               The dataset was collected for 3 minutes (180 seconds).
+        n_features (int): Number of sensor features.
+
+    Returns:
+        tuple: A tuple containing the features (X_sequences) and labels (y_labels).
+    """
+    all_data = []
+    labels = []
+
+    # Map freshness levels (D1, D2, etc.) to numerical categories
+    freshness_mapping = {'D1': 0, 'D2': 1, 'D3': 2, 'D4': 3, 'D5': 4}
+    
+    # Create a reverse mapping for plotting later
+    freshness_labels = {v: k for k, v in freshness_mapping.items()}
+
+    print("--- Loading and parsing data files ---")
+    for filename in os.listdir(data_dir):
+        if filename.endswith(".csv"):
+            filepath = os.path.join(data_dir, filename)
+            
+            # Infer label from filename (e.g., 'Banana D2.csv' -> 'D2')
+            parts = filename.replace('.csv', '').split(' ')
+            if len(parts) > 1 and parts[-1] in freshness_mapping:
+                label_str = parts[-1]
+                label = freshness_mapping[label_str]
+                
+                try:
+                    df = pd.read_csv(filepath)
+                    # Filter for sensor columns (MQ2 to MQ135)
+                    sensor_columns = [col for col in df.columns if col.startswith('MQ')]
+                    df = df[sensor_columns]
+                    
+                    # Ensure the dataframe has enough data points to create sequences
+                    if len(df) >= sequence_length:
+                        # Extract sequences of the specified length
+                        for i in range(0, len(df) - sequence_length + 1, sequence_length):
+                            sequence = df.iloc[i:i + sequence_length].values
+                            all_data.append(sequence)
+                            labels.append(label)
+
+                except Exception as e:
+                    print(f"Could not read file {filename}: {e}")
+            else:
+                print(f"Skipping file with unrecognized freshness label: {filename}")
+
+    if not all_data:
+        raise ValueError("No valid data files found or processed. Please check the data_dir path and file names.")
+        
+    X_sequences = np.array(all_data)
+    y_labels = np.array(labels)
+    
+    print(f"Total sequences loaded: {len(X_sequences)}")
+    print(f"Shape of features (X): {X_sequences.shape}")
+    print(f"Shape of labels (y): {y_labels.shape}")
+    
+    return X_sequences, y_labels, freshness_labels
+
+# --- 2. Data Scaling ---
+def scale_data(X_train, X_test):
+    """
+    Scales the time-series data using StandardScaler.
+    Applies the scaler to each feature (sensor) across the time steps.
+    """
+    print("\n--- Scaling data ---")
+    # Reshape the data for scaling: (n_samples * sequence_length, n_features)
+    n_samples, seq_len, n_features = X_train.shape
+    X_train_reshaped = X_train.reshape(-1, n_features)
+    
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_reshaped)
+    
+    # Reshape back to the original format: (n_samples, sequence_length, n_features)
+    X_train_scaled = X_train_scaled.reshape(n_samples, seq_len, n_features)
+    
+    # Apply the same scaler to the test set
+    X_test_reshaped = X_test.reshape(-1, n_features)
+    X_test_scaled = scaler.transform(X_test_reshaped)
+    X_test_scaled = X_test_scaled.reshape(X_test.shape)
+    
+    return X_train_scaled, X_test_scaled
+
+# --- 3. Deep Learning Model Architectures ---
+
+def build_cnn_model(input_shape, num_classes):
+    """
+    Builds a 1D Convolutional Neural Network (CNN) model.
+    Excellent for extracting local features from time series data.
+    """
+    model = Sequential([
+        Conv1D(filters=64, kernel_size=5, activation='relu', input_shape=input_shape),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.3),
+        Conv1D(filters=128, kernel_size=5, activation='relu'),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.3),
+        Flatten(),
+        Dense(100, activation='relu'),
+        Dropout(0.5),
+        Dense(num_classes, activation='softmax')
+    ])
+    model.compile(optimizer='adam',
+                  loss='categorical_crossentropy',
+                  metrics=['accuracy'])
+    return model
+
+def build_lstm_model(input_shape, num_classes):
+    """
+    Builds a Long Short-Term Memory (LSTM) model.
+    Ideal for capturing long-range temporal dependencies.
+    """
+    model = Sequential([
+        LSTM(100, return_sequences=True, input_shape=input_shape),
+        Dropout(0.3),
+        LSTM(50),
+        Dropout(0.3),
+        Dense(50, activation='relu'),
+        Dense(num_classes, activation='softmax')
+    ])
+    model.compile(optimizer='adam',
+                  loss='categorical_crossentropy',
+                  metrics=['accuracy'])
+    return model
+
+def build_cnn_lstm_model(input_shape, num_classes):
+    """
+    Builds a hybrid CNN-LSTM model.
+    Uses CNN for feature extraction and LSTM for sequence modeling.
+    This is a very strong architecture for this type of data.
+    """
+    model = Sequential([
+        # CNN part for feature extraction
+        Conv1D(filters=64, kernel_size=5, activation='relu', input_shape=input_shape),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.3),
+        # LSTM part for sequence modeling
+        LSTM(100, return_sequences=True), # 'return_sequences=True' to stack another LSTM layer
+        Dropout(0.3),
+        LSTM(50), # The final LSTM layer can return a single output
+        Dropout(0.3),
+        Dense(50, activation='relu'),
+        Dense(num_classes, activation='softmax')
+    ])
+    model.compile(optimizer='adam',
+                  loss='categorical_crossentropy',
+                  metrics=['accuracy'])
+    return model
+
+# --- 4. Training and Evaluation ---
+
+def train_and_evaluate(model, X_train, y_train, X_test, y_test, epochs=50, batch_size=32):
+    """
+    Trains the model and evaluates its performance.
+    
+    Args:
+        model (tf.keras.Model): The compiled Keras model.
+        X_train (np.array): Training features.
+        y_train (np.array): Training labels (one-hot encoded).
+        X_test (np.array): Testing features.
+        y_test (np.array): Testing labels (one-hot encoded).
+        epochs (int): Number of training epochs.
+        batch_size (int): Batch size for training.
+    """
+    print(f"\n--- Training {model.name} ---")
+    model.summary()
+
+    # Callbacks for better training
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    model_checkpoint = ModelCheckpoint(f'{model.name}_best_model.h5', monitor='val_accuracy', save_best_only=True, mode='max', verbose=1)
+
+    history = model.fit(X_train, y_train,
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        validation_data=(X_test, y_test),
+                        callbacks=[early_stopping, model_checkpoint],
+                        verbose=1)
+
+    # Evaluate the model on the test set
+    loss, accuracy = model.evaluate(X_test, y_test, verbose=0)
+    print(f"\n{model.name} - Test Accuracy: {accuracy:.4f}, Test Loss: {loss:.4f}")
+
+    # Make predictions and generate a classification report
+    y_pred_probs = model.predict(X_test)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+    y_true = np.argmax(y_test, axis=1)
+
+    print("\n--- Classification Report ---")
+    print(classification_report(y_true, y_pred, target_names=[freshness_labels[i] for i in range(y_train.shape[1])]))
+    
+    # Plot training history
+    plot_training_history(history, model.name)
+    
+    # Plot confusion matrix
+    plot_confusion_matrix(y_true, y_pred, freshness_labels, model.name)
+
+    return model, history
+
+def plot_training_history(history, model_name):
+    """Plots the training and validation accuracy and loss history."""
+    plt.figure(figsize=(12, 5))
+    
+    # Plot training & validation accuracy values
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['accuracy'])
+    plt.plot(history.history['val_accuracy'])
+    plt.title(f'{model_name} - Model Accuracy')
+    plt.ylabel('Accuracy')
+    plt.xlabel('Epoch')
+    plt.legend(['Train', 'Validation'], loc='upper left')
+    
+    # Plot training & validation loss values
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['loss'])
+    plt.plot(history.history['val_loss'])
+    plt.title(f'{model_name} - Model Loss')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend(['Train', 'Validation'], loc='upper left')
+    
+    plt.tight_layout()
+    plt.show()
+    
+def plot_confusion_matrix(y_true, y_pred, freshness_labels, model_name):
+    """Plots the confusion matrix."""
+    cm = confusion_matrix(y_true, y_pred)
+    class_names = [freshness_labels[i] for i in range(len(freshness_labels))]
+    
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+    plt.title(f'{model_name} - Confusion Matrix')
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.show()
+
+# --- 5. Main Execution ---
+
+if __name__ == "__main__":
+    # Define the directory where your dataset is located.
+    # IMPORTANT: Change this path to where you have extracted the dataset files.
+    DATA_DIRECTORY = '/kaggle/input/food-freshness-electronic-nose-data/AllSmaples-Report' # e.g., 'C:/Users/YourUser/Downloads/food-freshness-electronic-nose-data'
+    
+    # --- Step A: Load and Preprocess Data ---
+    try:
+        X, y_raw, freshness_labels = load_and_preprocess_data(DATA_DIRECTORY)
+        
+        # One-hot encode the labels for multi-class classification
+        num_classes = len(np.unique(y_raw))
+        y_one_hot = tf.keras.utils.to_categorical(y_raw, num_classes=num_classes)
+        
+        # Split data into training and testing sets
+        X_train, X_test, y_train, y_test = train_test_split(X, y_one_hot, test_size=0.2, random_state=42, stratify=y_raw)
+        
+        # --- Step B: Scale the Data ---
+        X_train_scaled, X_test_scaled = scale_data(X_train, X_test)
+        
+        # Get input shape for the models
+        input_shape = (X_train_scaled.shape[1], X_train_scaled.shape[2])
+        
+        # --- Step C: Build and Train Models ---
+        
+        # Model 1: CNN
+        cnn_model = build_cnn_model(input_shape, num_classes)
+        trained_cnn_model, cnn_history = train_and_evaluate(cnn_model, X_train_scaled, y_train, X_test_scaled, y_test)
+        
+        # Model 2: LSTM
+        lstm_model = build_lstm_model(input_shape, num_classes)
+        trained_lstm_model, lstm_history = train_and_evaluate(lstm_model, X_train_scaled, y_train, X_test_scaled, y_test)
+
+        # Model 3: CNN-LSTM Hybrid (Recommended)
+        cnn_lstm_model = build_cnn_lstm_model(input_shape, num_classes)
+        trained_cnn_lstm_model, cnn_lstm_history = train_and_evaluate(cnn_lstm_model, X_train_scaled, y_train, X_test_scaled, y_test)
+
+        print("\n--- Training complete. Best models are saved as .h5 files. ---")
+        
+    except ValueError as e:
+        print(f"An error occurred: {e}. Please ensure the 'DATA_DIRECTORY' path is correct and contains valid CSV files.")
+    except FileNotFoundError:
+        print(f"Error: The directory '{DATA_DIRECTORY}' was not found. Please check the path and try again.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
